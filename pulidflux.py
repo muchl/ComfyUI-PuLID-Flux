@@ -63,102 +63,121 @@ class PulidFluxModel(nn.Module):
         return self.pulid_encoder(face_embed, clip_embeds)
 
 def forward_orig(
-    self,
-    img: Tensor,
-    img_ids: Tensor,
-    txt: Tensor,
-    txt_ids: Tensor,
-    timesteps: Tensor,
-    y: Tensor,
-    guidance: Tensor = None,
-    control=None,
-    transformer_options={},
-) -> Tensor:
-    patches_replace = transformer_options.get("patches_replace", {})
-    if img.ndim != 3 or txt.ndim != 3:
-        raise ValueError("Input img and txt tensors must have 3 dimensions.")
+        self,
+        img: Tensor,
+        img_ids: Tensor,
+        txt: Tensor,
+        txt_ids: Tensor,
+        timesteps: Tensor,
+        y: Tensor,
+        guidance: Tensor = None,
+        control = None,
+        transformer_options={},
+        attn_mask: Tensor = None,
+    ) -> Tensor:
+        patches_replace = transformer_options.get("patches_replace", {})
+        if img.ndim != 3 or txt.ndim != 3:
+            raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
-    # running on sequences img
-    img = self.img_in(img)
-    vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
-    if self.params.guidance_embed:
-        if guidance is None:
-            raise ValueError("Didn't get guidance strength for guidance distilled model.")
-        vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
+        # running on sequences img
+        img = self.img_in(img)
+        vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
+        if self.params.guidance_embed:
+            if guidance is None:
+                raise ValueError("Didn't get guidance strength for guidance distilled model.")
+            vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
 
-    vec = vec + self.vector_in(y[:,:self.params.vec_in_dim])
-    txt = self.txt_in(txt)
+        vec = vec + self.vector_in(y[:,:self.params.vec_in_dim])
+        txt = self.txt_in(txt)
 
-    ids = torch.cat((txt_ids, img_ids), dim=1)
-    pe = self.pe_embedder(ids)
+        ids = torch.cat((txt_ids, img_ids), dim=1)
+        pe = self.pe_embedder(ids)
 
-    ca_idx = 0
-    blocks_replace = patches_replace.get("dit", {})
-    for i, block in enumerate(self.double_blocks):
-        if ("double_block", i) in blocks_replace:
-            def block_wrap(args):
-                out = {}
-                out["img"], out["txt"] = block(img=args["img"], txt=args["txt"], vec=args["vec"], pe=args["pe"])
-                return out
+        blocks_replace = patches_replace.get("dit", {})
+        ca_idx = 0
+        for i, block in enumerate(self.double_blocks):
+            if ("double_block", i) in blocks_replace:
+                def block_wrap(args):
+                    out = {}
+                    out["img"], out["txt"] = block(img=args["img"],
+                                                   txt=args["txt"],
+                                                   vec=args["vec"],
+                                                   pe=args["pe"],
+                                                   attn_mask=args.get("attn_mask"))
+                    return out
 
-            out = blocks_replace[("double_block", i)]({"img": img, "txt": txt, "vec": vec, "pe": pe}, {"original_block": block_wrap})
-            txt = out["txt"]
-            img = out["img"]
-        else:
-            img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
+                out = blocks_replace[("double_block", i)]({"img": img,
+                                                           "txt": txt,
+                                                           "vec": vec,
+                                                           "pe": pe,
+                                                           "attn_mask": attn_mask},
+                                                          {"original_block": block_wrap})
+                txt = out["txt"]
+                img = out["img"]
+            else:
+                img, txt = block(img=img,
+                                 txt=txt,
+                                 vec=vec,
+                                 pe=pe,
+                                 attn_mask=attn_mask)
 
-        if control is not None: # Controlnet
-            control_i = control.get("input")
-            if i < len(control_i):
-                add = control_i[i]
-                if add is not None:
-                    img += add
+            if control is not None: # Controlnet
+                control_i = control.get("input")
+                if i < len(control_i):
+                    add = control_i[i]
+                    if add is not None:
+                        img += add
 
-        # PuLID attention
-        if self.pulid_data:
-            if i % self.pulid_double_interval == 0:
+            # PuLID attention
+            if self.pulid_data and i % self.pulid_double_interval == 0:
                 # Will calculate influence of all pulid nodes at once
                 for _, node_data in self.pulid_data.items():
                     if torch.any((node_data['sigma_start'] >= timesteps) & (timesteps >= node_data['sigma_end'])):
                         img = img + node_data['weight'] * self.pulid_ca[ca_idx](node_data['embedding'], img)
                 ca_idx += 1
+        
+        img = torch.cat((txt, img), 1)
 
-    img = torch.cat((txt, img), 1)
+        for i, block in enumerate(self.single_blocks):
+            if ("single_block", i) in blocks_replace:
+                def block_wrap(args):
+                    out = {}
+                    out["img"] = block(args["img"],
+                                       vec=args["vec"],
+                                       pe=args["pe"],
+                                       attn_mask=args.get("attn_mask"))
+                    return out
 
-    for i, block in enumerate(self.single_blocks):
-        if ("single_block", i) in blocks_replace:
-            def block_wrap(args):
-                out = {}
-                out["img"] = block(args["img"], vec=args["vec"], pe=args["pe"])
-                return out
+                out = blocks_replace[("single_block", i)]({"img": img,
+                                                           "vec": vec,
+                                                           "pe": pe,
+                                                           "attn_mask": attn_mask}, 
+                                                          {"original_block": block_wrap})
+                img = out["img"]
+            else:
+                img = block(img, vec=vec, pe=pe, attn_mask=attn_mask)
 
-            out = blocks_replace[("single_block", i)]({"img": img, "vec": vec, "pe": pe}, {"original_block": block_wrap})
-            img = out["img"]
-        else:
-            img = block(img, vec=vec, pe=pe)
+            if control is not None: # Controlnet
+                control_o = control.get("output")
+                if i < len(control_o):
+                    add = control_o[i]
+                    if add is not None:
+                        img[:, txt.shape[1]:, ...] += add
 
-        if control is not None: # Controlnet
-            control_o = control.get("output")
-            if i < len(control_o):
-                add = control_o[i]
-                if add is not None:
-                    img[:, txt.shape[1] :, ...] += add
-
-        # PuLID attention
-        if self.pulid_data:
-            real_img, txt = img[:, txt.shape[1]:, ...], img[:, :txt.shape[1], ...]
-            if i % self.pulid_single_interval == 0:
-                # Will calculate influence of all nodes at once
+            # PuLID attention
+            if self.pulid_data and i % self.pulid_single_interval == 0:
+                real_img, txt = img[:, txt.shape[1]:, ...], img[:, :txt.shape[1], ...]
                 for _, node_data in self.pulid_data.items():
                     if torch.any((node_data['sigma_start'] >= timesteps) & (timesteps >= node_data['sigma_end'])):
                         real_img = real_img + node_data['weight'] * self.pulid_ca[ca_idx](node_data['embedding'], real_img)
                 ca_idx += 1
-            img = torch.cat((txt, real_img), 1)
+                img = torch.cat((txt, real_img), 1)
 
-    img = img[:, txt.shape[1] :, ...]
+        img = img[:, txt.shape[1]:, ...]
 
-    img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
-    return img
+        img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
+        return img
+
 
 def tensor_to_image(tensor):
     image = tensor.mul(255).clamp(0, 255).byte().cpu()
