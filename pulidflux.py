@@ -8,6 +8,7 @@ import logging
 import folder_paths
 import comfy.utils
 from comfy.ldm.flux.layers import timestep_embedding
+import comfy.model_management
 from insightface.app import FaceAnalysis
 from facexlib.parsing import init_parsing_model
 from facexlib.utils.face_restoration_helper import FaceRestoreHelper
@@ -75,6 +76,7 @@ def forward_orig(
         transformer_options={},
         attn_mask: Tensor = None,
     ) -> Tensor:
+        device = comfy.model_management.get_torch_device()
         patches_replace = transformer_options.get("patches_replace", {})
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
@@ -133,7 +135,7 @@ def forward_orig(
                 # Will calculate influence of all pulid nodes at once
                 for _, node_data in self.pulid_data.items():
                     if torch.any((node_data['sigma_start'] >= timesteps) & (timesteps >= node_data['sigma_end'])):
-                        img = img + node_data['weight'] * self.pulid_ca[ca_idx](node_data['embedding'], img)
+                        img = img + node_data['weight'] * self.pulid_ca[ca_idx].to(device)(node_data['embedding'], img)
                 ca_idx += 1
         
         img = torch.cat((txt, img), 1)
@@ -169,7 +171,7 @@ def forward_orig(
                 real_img, txt = img[:, txt.shape[1]:, ...], img[:, :txt.shape[1], ...]
                 for _, node_data in self.pulid_data.items():
                     if torch.any((node_data['sigma_start'] >= timesteps) & (timesteps >= node_data['sigma_end'])):
-                        real_img = real_img + node_data['weight'] * self.pulid_ca[ca_idx](node_data['embedding'], real_img)
+                        real_img = real_img + node_data['weight'] * self.pulid_ca[ca_idx].to(device)(node_data['embedding'], real_img)
                 ca_idx += 1
                 img = torch.cat((txt, real_img), 1)
 
